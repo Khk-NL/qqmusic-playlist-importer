@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QQ音乐歌单导入 · 改造版
 // @namespace    https://y.qq.com/
-// @version      0.2.0
+// @version      0.2.1
 // @downloadURL  https://raw.githubusercontent.com/Khk-NL/qqmusic-playlist-importer/main/qqmusic_playlist_import.user.js
 // @updateURL    https://raw.githubusercontent.com/Khk-NL/qqmusic-playlist-importer/main/qqmusic_playlist_import.user.js
 // @description  根据 CSV 中的 song,artist 列表批量添加歌曲到指定 QQ 音乐歌单，不存在时自动创建。
@@ -965,7 +965,7 @@
   function cleanCandidateTitle(input) {
     return normalizeText(
       stripActionSuffix(String(input || ""))
-        .replace(/^(?:mv|vip|sq|hq)\s*/gi, "")
+        .replace(/^(?:mv|vip|sq|hq)\b\s*/gi, "")
         .replace(/^\s*(?:mv|vip|sq|hq)\b/gi, "")
         .trim()
     );

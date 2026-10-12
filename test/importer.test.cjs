@@ -4,7 +4,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../qqmusic_playlist_import.user.js'), 'utf8');
-const exposed = ['parseCsv','planSongs','chooseCandidate','dedupeCandidates','saveJob','loadJob','clearJob','assertActive','findPlaylistRowByName','findPlaylistChoiceInMenu','runAutomation','processCurrentSong','addCandidateToPlaylist'];
+const exposed = ['parseCsv','planSongs','chooseCandidate','cleanCandidateTitle','dedupeCandidates','saveJob','loadJob','clearJob','assertActive','findPlaylistRowByName','findPlaylistChoiceInMenu','runAutomation','processCurrentSong','addCandidateToPlaylist'];
 
 function harness() {
   const storage = new Map();
@@ -35,6 +35,11 @@ function harness() {
 function candidate(overrides={}) {
   return {title:'Radiant',artists:['MSR'],album:'Radiant',mid:'001uwAoL3UzXbg',isLikelyMv:false,addButton:{},row:{},...overrides};
 }
+test('歌名以 Sq 开头时不被误当作音质标记',()=>{
+  const {a}=harness();
+  assert.equal(a.cleanCandidateTitle('Squad Unknown'),'squad unknown');
+  assert.equal(a.cleanCandidateTitle('SQ Radiant'),'radiant');
+});
 function job(overrides={}) {
   return {id:'task-1',status:'running',stopRequested:false,preview:true,playlistEnsured:true,currentIndex:0,
     playlistName:'明日方舟 EP 与人声曲',songs:[{song:'Radiant',artist:'MSR',status:'pending'}],logs:[],...overrides};

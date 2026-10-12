@@ -9,6 +9,9 @@
 *.log
 *.pid
 /serve_install.py
+/collect_metadata.cjs
+/预检过程.json
+/github-published.png
 
 # Local QQ Music page snapshots used only for local debugging/analysis
 我的音乐 - QQ音乐-千万正版音乐海量无损曲库新歌热歌天天畅听的高品质音乐平台！.html
