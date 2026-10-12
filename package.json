@@ -1,0 +1,10 @@
+{
+  "name": "qqmusic-playlist-importer",
+  "version": "0.2.0",
+  "private": true,
+  "description": "QQ 音乐网页 CSV 歌单导入器，基于上游油猴脚本改造",
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "check": "node --check qqmusic_playlist_import.user.js"
+  }
+}

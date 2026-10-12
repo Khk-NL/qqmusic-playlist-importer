@@ -1,7 +1,9 @@
 // ==UserScript==
-// @name         QQ音乐歌单批量导入
+// @name         QQ音乐歌单导入 · 改造版
 // @namespace    https://y.qq.com/
-// @version      0.1.1
+// @version      0.2.0
+// @downloadURL  https://raw.githubusercontent.com/Khk-NL/qqmusic-playlist-importer/main/qqmusic_playlist_import.user.js
+// @updateURL    https://raw.githubusercontent.com/Khk-NL/qqmusic-playlist-importer/main/qqmusic_playlist_import.user.js
 // @description  根据 CSV 中的 song,artist 列表批量添加歌曲到指定 QQ 音乐歌单，不存在时自动创建。
 // @author       Codex
 // @match        https://y.qq.com/*
@@ -12,7 +14,7 @@
 (function () {
   "use strict";
 
-  const STORAGE_KEY = "__qqmusic_playlist_import_job_v1__";
+  const STORAGE_KEY = "__qqmusic_playlist_import_job_v2__";
   const LAST_PLAYLIST_KEY = "__qqmusic_playlist_import_last_playlist__";
   const PANEL_ID = "qqmusic-playlist-import-panel";
   const STYLE_ID = "qqmusic-playlist-import-style";
@@ -24,6 +26,7 @@
   const runtime = {
     automationLocked: false,
     mounted: false,
+    activeJobId: null,
   };
 
   function sleep(ms) {
@@ -47,10 +50,28 @@
     return safeJsonParse(localStorage.getItem(STORAGE_KEY), null);
   }
 
-  function saveJob(job) {
+  function saveJob(job, initial = false) {
+    const stored = loadJob();
+    if (!initial) {
+      if (!stored || stored.id !== job.id) return false;
+      // A stop/clear/new task can occur while an async operation is awaiting.
+      job.stopRequested = job.stopRequested || stored.stopRequested;
+      if (job.stopRequested && job.status === "running") job.status = "stopped";
+    }
     job.updatedAt = Date.now();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(job));
     renderPanel();
+    return true;
+  }
+
+  function assertActive() {
+    if (!runtime.activeJobId) return;
+    const latest = loadJob();
+    if (!latest || latest.id !== runtime.activeJobId || latest.stopRequested || latest.status !== "running") {
+      const error = new Error("任务已停止、清除或替换。");
+      error.cancelled = true;
+      throw error;
+    }
   }
 
   function clearJob() {
@@ -187,10 +208,7 @@
   }
 
   function normalizeArtistName(input) {
-    return normalizeText(input)
-      .replace(/^(?:女神|男神|原唱|翻唱|演唱|歌手|主播|网络歌手|抖音热歌|qq音乐推荐|官方推荐)\s*/i, "")
-      .replace(/\s*(?:官方|专区|频道)$/i, "")
-      .trim();
+    return normalizeText(input);
   }
 
   function buildArtistTokens(input) {
@@ -276,6 +294,7 @@
     }
     row.push(current);
     rows.push(row);
+    if (insideQuote) throw new Error("CSV 中存在未闭合的引号。");
 
     const cleanRows = rows
       .map((cells) => cells.map((cell) => String(cell || "").trim()))
@@ -292,6 +311,10 @@
       throw new Error("CSV 表头必须包含 song,artist 两列。");
     }
 
+    const optional = (cells, name) => {
+      const index = header.indexOf(name);
+      return index < 0 ? "" : (cells[index] || "").trim();
+    };
     const seen = new Set();
     const songs = [];
     let duplicateCount = 0;
@@ -300,10 +323,18 @@
       const cells = cleanRows[i];
       const song = (cells[songIndex] || "").trim();
       const artist = (cells[artistIndex] || "").trim();
-      if (!song || !artist) {
-        continue;
+      if (!song || !artist) throw new Error(`第 ${i + 1} 行缺少 song 或 artist。`);
+      const mid = optional(cells, "mid");
+      const date = optional(cells, "date");
+      const album = optional(cells, "album");
+      const variantValue = optional(cells, "allow_variant").toLowerCase();
+      if (mid && !/^[A-Za-z0-9]{14}$/.test(mid)) throw new Error(`第 ${i + 1} 行 mid 无效。`);
+      if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date)) {
+        throw new Error(`第 ${i + 1} 行 date 必须是有效的 YYYY-MM-DD。`);
       }
-      const key = makeSongKey(song, artist);
+      if (variantValue && !["true", "false", "1", "0"].includes(variantValue)) throw new Error(`第 ${i + 1} 行 allow_variant 无效。`);
+      const allowVariant = ["true", "1"].includes(variantValue);
+      const key = compactText(song);
       if (seen.has(key)) {
         duplicateCount += 1;
         continue;
@@ -312,6 +343,7 @@
       songs.push({
         song,
         artist,
+        mid, date, album, allowVariant,
         key,
         status: "pending",
         detail: "",
@@ -325,6 +357,17 @@
     return { songs, duplicateCount };
   }
 
+  function planSongs(songs, order = "input", insertion = "head") {
+    if (!["input", "date-desc"].includes(order) || !["head", "tail"].includes(insertion)) throw new Error("未知排序设置。");
+    const desired = songs.map((item) => ({ ...item }));
+    if (order === "date-desc") {
+      if (desired.some((item) => !item.date)) throw new Error("按发行日期排序要求每首歌都有 date 列；请先核对日期。");
+      desired.sort((a, b) => b.date.localeCompare(a.date));
+    }
+    desired.forEach((item, index) => { item.desiredIndex = index; });
+    return insertion === "head" ? desired.reverse() : desired;
+  }
+
   function buildSummary(job) {
     if (!job) {
       return "暂无任务。";
@@ -335,6 +378,7 @@
     const notFound = job.songs.filter((item) => item.status === "not_found").length;
     const ambiguous = job.songs.filter((item) => item.status === "ambiguous").length;
     const failed = job.songs.filter((item) => item.status === "failed").length;
+    const matched = job.songs.filter((item) => item.status === "matched").length;
     const header = [
       `状态: ${job.status}`,
       `目标歌单: ${job.playlistName}`,
@@ -344,6 +388,7 @@
       `not_found=${notFound}`,
       `ambiguous=${ambiguous}`,
       `failed=${failed}`,
+      `matched=${matched}`,
     ].join(" | ");
     const details = job.logs && job.logs.length
       ? job.logs.map((item) => `[${item.time}] ${item.message}`).join("\n")
@@ -371,9 +416,19 @@
         <span>CSV 文件</span>
         <input data-role="csv-file" type="file" accept=".csv,text/csv" />
       </label>
-      <div class="qqm-import__hint" data-role="hint">CSV 表头固定为 song,artist</div>
+      <label class="qqm-import__label"><span>目标顺序</span>
+        <select data-role="order"><option value="input">CSV 原顺序</option><option value="date-desc">发行日期从新到旧（需要 date）</option></select>
+      </label>
+      <label class="qqm-import__label"><span>QQ 新歌插入位置</span>
+        <select data-role="insertion"><option value="head">顶部（倒序执行）</option><option value="tail">末尾（正序执行）</option></select>
+      </label>
+      <div class="qqm-import__hint" data-role="hint">建议先选“仅预检”。排序需空歌单及确认插入位置，已有歌曲不会被重排。</div>
+      <label><input data-role="preview" type="checkbox" checked /> 仅预检，搜索匹配并记录结果，不写入歌单</label>
       <div class="qqm-import__buttons">
         <button data-role="start">开始导入</button>
+        <button data-role="resume">继续</button>
+        <button data-role="retry">重试未成功项</button>
+        <button data-role="export">导出结果</button>
         <button data-role="stop" class="qqm-import__ghost">停止</button>
         <button data-role="copy" class="qqm-import__ghost">复制日志</button>
         <button data-role="clear" class="qqm-import__ghost">清除任务</button>
@@ -400,6 +455,7 @@
         alert("请先填写目标歌单名。");
         return;
       }
+      if (playlistName.length > 20) { alert("QQ 音乐歌单名不能超过 20 个字符。"); return; }
       if (!file) {
         alert("请先选择 CSV 文件。");
         return;
@@ -416,7 +472,11 @@
         const text = await file.text();
         const parsed = parseCsv(text);
         const job = {
-          version: 1,
+          version: 2,
+          id: crypto.randomUUID(),
+          preview: panel.querySelector('[data-role="preview"]').checked,
+          order: panel.querySelector('[data-role="order"]').value,
+          insertion: panel.querySelector('[data-role="insertion"]').value,
           status: "running",
           stopRequested: false,
           playlistName,
@@ -426,14 +486,14 @@
           playlistEnsured: false,
           ensureAttempts: 0,
           activeQuery: "",
-          songs: parsed.songs,
+          songs: planSongs(parsed.songs, panel.querySelector('[data-role="order"]').value, panel.querySelector('[data-role="insertion"]').value),
           logs: [],
         };
         jobLog(job, "info", `已载入 ${parsed.songs.length} 首歌曲，目标歌单“${playlistName}”。`);
         if (parsed.duplicateCount > 0) {
           jobLog(job, "info", `已跳过 ${parsed.duplicateCount} 条 CSV 内重复记录。`);
         }
-        saveJob(job);
+        saveJob(job, true);
         fileInput.value = "";
         await runAutomation();
       } catch (error) {
@@ -442,6 +502,35 @@
       }
     });
 
+    panel.querySelector('[data-role="resume"]').addEventListener("click", () => {
+      if (runtime.automationLocked) return;
+      const job = loadJob();
+      if (job) { job.stopRequested = false; job.status = "running"; saveJob(job, true); }
+    });
+    panel.querySelector('[data-role="retry"]').addEventListener("click", () => {
+      if (runtime.automationLocked) return;
+      const job = loadJob();
+      if (!job || job.status === "running") return;
+      if (job.order === "date-desc" && !job.preview && [...job.songs, ...(job.history || [])].some((item) => item.status === "added" || item.status === "skipped")) {
+        alert("部分歌曲已写入，单独补加会破坏发行日期顺序。请导出结果、补齐清单后使用新空歌单重新导入。");
+        return;
+      }
+      const remaining = job.songs.filter((item) => !["added", "skipped", "matched"].includes(item.status));
+      if (!remaining.length) return;
+      job.id = crypto.randomUUID();
+      job.history = [...(job.history || []), ...job.songs.filter((item) => ["added", "skipped", "matched"].includes(item.status))];
+      job.songs = remaining.map((item) => ({ ...item, status: "pending", detail: "" }));
+      job.currentIndex = 0; job.stopRequested = false; job.status = "running";
+      saveJob(job, true);
+    });
+    panel.querySelector('[data-role="export"]').addEventListener("click", () => {
+      const job = loadJob();
+      if (!job) return;
+      const link = document.createElement("a");
+      const url = URL.createObjectURL(new Blob([JSON.stringify(job, null, 2)], { type: "application/json" }));
+      link.href = url; link.download = "qqmusic-import-result.json"; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
     stopButton.addEventListener("click", () => {
       withJob((job) => {
         job.stopRequested = true;
@@ -499,6 +588,8 @@
       #${PANEL_ID} * {
         box-sizing: border-box;
       }
+      #${PANEL_ID} { max-height: calc(100vh - 36px); overflow-y: auto; }
+      #${PANEL_ID} select { width: 100%; padding: 9px; color: #f5f7f8; background: #253139; border-radius: 10px; }
       #${PANEL_ID} .qqm-import__header {
         display: flex;
         justify-content: space-between;
@@ -592,7 +683,7 @@
 
     if (!job) {
       badge.textContent = "idle";
-      hint.textContent = "CSV 表头固定为 song,artist";
+      hint.textContent = "建议先预检。排序需空歌单及确认插入位置；已有歌曲不会重排。";
       progress.textContent = "尚未开始。";
       output.value = "暂无任务。";
       return;
@@ -606,11 +697,11 @@
     const current = job.songs[job.currentIndex];
 
     badge.textContent = job.status;
-    hint.textContent = `目标歌单：${job.playlistName}`;
+    hint.textContent = `${job.preview ? "仅预检" : "写入"}：${job.playlistName}；${job.order === "date-desc" ? "发行日期从新到旧" : "CSV 顺序"}。最终顺序仍需核对。`;
     progress.textContent = [
       `进度：${Math.min(job.currentIndex, job.songs.length)}/${job.songs.length}`,
       `当前：${current ? `${current.song} - ${current.artist}` : "无"}`,
-      `统计：added=${added}, skipped=${skipped}, not_found=${notFound}, ambiguous=${ambiguous}, failed=${failed}`,
+      `统计：added=${added}, skipped=${skipped}, not_found=${notFound}, ambiguous=${ambiguous}, failed=${failed}, matched=${job.songs.filter((item) => item.status === "matched").length}`,
     ].join("\n");
     output.value = buildSummary(job);
   }
@@ -661,11 +752,13 @@
     if (!element) {
       throw new Error("点击目标不存在。");
     }
+    assertActive();
     element.scrollIntoView({ block: "center", behavior: "smooth" });
     await sleep(120);
     element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
     element.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await sleep(80);
+    assertActive();
     element.click();
     await sleep(160);
   }
@@ -673,6 +766,7 @@
   async function waitFor(fn, timeout = 8000, interval = 160) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
+      assertActive();
       const result = fn();
       if (result) {
         return result;
@@ -700,20 +794,15 @@
   }
 
   function isLoggedIn() {
-    if (document.querySelector(".profile_unlogin__btn")) {
-      return false;
-    }
-    if (/uin=/.test(document.cookie) || /qqmusic_key=/.test(document.cookie)) {
-      return true;
-    }
-    const avatar = document.querySelector(".js_userInfo_img");
-    return !!(avatar && avatar.getAttribute("src"));
+    if (document.querySelector(".profile_unlogin__btn")) return false;
+    return !!document.querySelector('a[href="/n/ryqq_v2/profile"] img, .js_userInfo_img');
   }
 
   function navigate(url) {
     if (location.href === url) {
       return false;
     }
+    assertActive();
     location.assign(url);
     return true;
   }
@@ -724,33 +813,17 @@
   }
 
   function findPlaylistRowByName(playlistName) {
-    const expected = compactText(playlistName);
-    const rows = document.querySelectorAll(".playlist__item");
-    for (const row of rows) {
-      const titleNode = row.querySelector(".playlist__title_txt a, .playlist__title_txt, .playlist__title a");
-      const title = compactText(titleNode ? titleNode.textContent : row.textContent);
-      if (title && (title === expected || title.includes(expected) || expected.includes(title))) {
-        return row;
-      }
-    }
-    return null;
+    const rows = [...document.querySelectorAll(".playlist__item")].filter((row) => {
+      const title = row.querySelector(".playlist__title_txt a");
+      return title && normalizeText(title.textContent) === normalizeText(playlistName);
+    });
+    if (rows.length > 1) throw new Error("存在多个同名歌单，请先改成唯一名称。");
+    return rows[0] || null;
   }
 
   function findCreatePlaylistInput() {
-    const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
-    for (const input of inputs) {
-      if (!isVisible(input)) {
-        continue;
-      }
-      if (input.closest(`#${PANEL_ID}`)) {
-        continue;
-      }
-      if (input.classList.contains("search_input__input")) {
-        continue;
-      }
-      return input;
-    }
-    return null;
+    const input = document.querySelector('[role="dialog"] #new_playlist');
+    return isVisible(input) ? input : null;
   }
 
   async function ensurePlaylist(job) {
@@ -767,6 +840,7 @@
     );
     if (!ready) {
       job.ensureAttempts += 1;
+      if (job.ensureAttempts > 4) throw new Error("自建歌单页连续加载超时，请检查页面和登录状态。");
       jobLog(job, "warn", "等待歌单页加载超时，稍后重试。");
       return false;
     }
@@ -779,6 +853,9 @@
 
     const existing = findPlaylistRowByName(job.playlistName);
     if (existing) {
+      job.playlistUrl = existing.querySelector(".playlist__title_txt a").href;
+      const count = Number((existing.querySelector(".playlist__number")?.textContent || "").replace(/\D/g, ""));
+      if (job.order === "date-desc" && count > 0) throw new Error("发行日期排序请使用空歌单；重复添加已有歌曲不能保证重排。");
       job.playlistEnsured = true;
       jobLog(job, "info", `已确认目标歌单“${job.playlistName}”存在。`);
       return true;
@@ -803,8 +880,7 @@
     setNativeValue(input, job.playlistName);
     await sleep(150);
 
-    const submitNode = findByVisibleText(["确定", "创建", "保存", "完成"]);
-    const submitButton = findClickableAncestor(submitNode);
+    const submitButton = document.querySelector('[role="dialog"] .popup_new_list .popup__ft .mod_btn_green');
     if (!submitButton) {
       throw new Error("未找到新建歌单确认按钮。");
     }
@@ -820,6 +896,7 @@
 
     const created = await waitFor(() => findPlaylistRowByName(job.playlistName), 5000);
     if (created) {
+      job.playlistUrl = created.querySelector(".playlist__title_txt a").href;
       job.playlistEnsured = true;
       jobLog(job, "info", `已创建歌单“${job.playlistName}”。`);
       return true;
@@ -830,32 +907,7 @@
   }
 
   function collectCandidateArtists(row) {
-    const artists = new Set();
-    const selectors = [
-      ".songlist__artist a",
-      ".songlist__artist_txt a",
-      ".songlist__singer a",
-      ".songlist__singer_txt a",
-      "[class*='artist'] a",
-      "[class*='singer'] a",
-      '.songlist__artist a[href*="/singer/"]',
-      'a[href*="/singer/"]',
-      ".songlist__artist",
-      ".songlist__artist_txt",
-      ".songlist__singer",
-      ".songlist__singer_txt",
-      "[class*='artist']",
-      "[class*='singer']",
-    ];
-    for (const selector of selectors) {
-      row.querySelectorAll(selector).forEach((node) => {
-        const text = normalizeText(node.textContent);
-        if (text) {
-          artists.add(text);
-        }
-      });
-    }
-    return [...artists];
+    return [...row.querySelectorAll(".songlist__artist a")].map((node) => normalizeText(node.getAttribute("title") || node.textContent)).filter(Boolean);
   }
 
   function getSongLinkFromRow(row) {
@@ -924,10 +976,7 @@
   }
 
   function hasVariantHint(text) {
-    const normalized = normalizeText(text);
-    return /(?:dj|live|remix|mix|伴奏|钢琴|纯音乐|合唱|快四|慢摇|广场舞|cover|剪辑|片段|铃声|翻唱|伴唱|demo|版\)|版）|版$|[_-]版$)/i.test(
-      normalized
-    );
+    return /\b(?:dj|live|remix|mix|instrumental|karaoke|demo|cover)\b|伴奏|钢琴|纯音乐|合唱|现场|翻唱|改编|剪辑|片段|铃声|广场舞/i.test(normalizeText(text));
   }
 
   function isLikelyMvCandidate(row, title, link) {
@@ -958,6 +1007,8 @@
       baseTitle,
       artists,
       songLink,
+      mid: songLink?.getAttribute("href")?.match(/\/songDetail\/([A-Za-z0-9]{14})/)?.[1] || "",
+      album: row.querySelector(".songlist__album a")?.textContent?.trim() || "",
       isVariant: hasVariantHint(rawTitle) || (!!baseTitle && compactText(baseTitle) !== compactText(title)),
       isLikelyMv: isLikelyMvCandidate(row, rawTitle, songLink),
       addButton,
@@ -967,16 +1018,8 @@
   function dedupeCandidates(candidates) {
     const unique = new Map();
     for (const candidate of candidates) {
-      const signature = [
-        compactText(candidate.title),
-        [...candidate.artists].map((item) => compactText(item)).sort().join("/"),
-      ].join("||");
-      if (!signature.replace(/\|/g, "")) {
-        continue;
-      }
-      if (!unique.has(signature)) {
-        unique.set(signature, candidate);
-      }
+      if (!candidate.mid) continue;
+      if (!unique.has(candidate.mid)) unique.set(candidate.mid, candidate);
     }
     return [...unique.values()];
   }
@@ -1005,104 +1048,18 @@
       .filter(Boolean))];
   }
 
-  function chooseCandidate(candidates, song, artist) {
-    const targetTitle = compactText(song);
-    const targetArtists = buildArtistTokens(artist);
-
-    const withScore = dedupeCandidates(candidates)
-      .filter((candidate) => candidate.title)
-      .map((candidate) => {
-        const titleCompact = compactText(candidate.title);
-        const baseTitleCompact = compactText(candidate.baseTitle || candidate.title);
-        const titleExact = titleCompact === targetTitle;
-        const baseTitleExact = baseTitleCompact === targetTitle;
-        const artistInfo = getArtistMatchInfo(candidate.artists, artist);
-        const titleLoose =
-          titleCompact.includes(targetTitle) ||
-          targetTitle.includes(titleCompact) ||
-          baseTitleCompact.includes(targetTitle) ||
-          targetTitle.includes(baseTitleCompact);
-        const rowText = compactText(candidate.row.textContent || "");
-        const rowHasArtist = targetArtists.some((item) => rowText.includes(compactText(item)));
-        const score =
-          (titleExact ? 130 : 0) +
-          (!titleExact && baseTitleExact ? 80 : 0) +
-          (!titleExact && !baseTitleExact && titleLoose ? 25 : 0) +
-          (artistInfo.exactSetEqual ? 80 : 0) +
-          (artistInfo.hasExactArtistText ? 20 : 0) +
-          (!artistInfo.exactSetEqual && artistInfo.targetCoveredExactly ? 50 : 0) +
-          (!artistInfo.targetCoveredExactly && artistInfo.targetCoveredLoosely ? 20 : 0) +
-          (!artistInfo.targetCoveredLoosely && rowHasArtist ? 20 : 0) +
-          (artistInfo.extraCount > 0 ? -25 * artistInfo.extraCount : 0) +
-          (candidate.songLink ? 10 : 0) +
-          (!candidate.isLikelyMv ? 10 : -60) +
-          (!candidate.isVariant ? 20 : -40) +
-          (candidate.addButton ? 5 : 0);
-        return {
-          ...candidate,
-          score,
-          titleExact,
-          baseTitleExact,
-          titleLoose,
-          artistExactSet: artistInfo.exactSetEqual,
-          artistTextExact: artistInfo.hasExactArtistText,
-          artistCovered: artistInfo.targetCoveredLoosely,
-          artistExtraCount: artistInfo.extraCount,
-          rowHasArtist,
-        };
-      })
-      .filter((candidate) => candidate.addButton);
-
-    const strict = withScore
-      .filter((candidate) => (candidate.titleExact || candidate.baseTitleExact) && candidate.artistCovered)
-      .sort((a, b) => b.score - a.score);
-    if (strict.length === 1) {
-      return { type: "selected", candidate: strict[0] };
-    }
-    if (strict.length > 1) {
-      if (
-        strict[0].score - strict[1].score >= 20 ||
-        (strict[0].artistExactSet && !strict[1].artistExactSet) ||
-        (strict[0].artistTextExact && !strict[1].artistTextExact) ||
-        (strict[0].titleExact && !strict[0].isVariant && !strict[0].isLikelyMv &&
-          (!strict[1].titleExact || strict[1].isVariant || strict[1].isLikelyMv))
-      ) {
-        return { type: "selected", candidate: strict[0] };
-      }
-      return { type: "ambiguous", candidates: strict.slice(0, 3) };
-    }
-
-    const weaker = withScore.filter(
-      (candidate) => candidate.titleLoose && (candidate.artistCovered || candidate.rowHasArtist)
-    );
-    if (weaker.length === 1) {
-      return { type: "selected", candidate: weaker[0] };
-    }
-    if (weaker.length > 1) {
-      const sorted = [...weaker].sort((a, b) => b.score - a.score);
-      if (sorted[0].score - sorted[1].score >= 20) {
-        return { type: "selected", candidate: sorted[0] };
-      }
-      return { type: "ambiguous", candidates: sorted.slice(0, 3) };
-    }
-
-    const titleOnly = withScore.filter((candidate) => candidate.titleExact || candidate.titleLoose);
-    if (titleOnly.length === 1) {
-      return { type: "selected", candidate: titleOnly[0] };
-    }
-    if (titleOnly.length > 1) {
-      const sorted = [...titleOnly].sort((a, b) => b.score - a.score);
-      if (
-        sorted[0].score - sorted[1].score >= 30 ||
-        (!sorted[0].isVariant && sorted[1].isVariant && !sorted[0].isLikelyMv) ||
-        (sorted[0].titleExact && !sorted[0].isLikelyMv && !sorted[1].titleExact)
-      ) {
-        return { type: "selected", candidate: sorted[0] };
-      }
-      return { type: "ambiguous", candidates: sorted.slice(0, 3) };
-    }
-
-    return { type: withScore.length === 0 ? "not_found" : "ambiguous", candidates: withScore.slice(0, 3) };
+  function chooseCandidate(candidates, song, artist, options = {}) {
+    const eligible = dedupeCandidates(candidates).filter((candidate) => {
+      if (candidate.isLikelyMv || compactText(candidate.title) !== compactText(song)) return false;
+      const info = getArtistMatchInfo(candidate.artists, artist);
+      if (!info.targetCoveredExactly) return false;
+      if (options.mid && options.mid !== candidate.mid) return false;
+      if (options.album && compactText(options.album) !== compactText(candidate.album)) return false;
+      if ((hasVariantHint(candidate.title) || hasVariantHint(candidate.album)) && !options.allowVariant) return false;
+      return true;
+    });
+    if (eligible.length === 1) return { type: "selected", candidate: eligible[0] };
+    return { type: eligible.length ? "ambiguous" : "not_found", candidates: eligible };
   }
 
   async function revealRowActions(row) {
@@ -1123,33 +1080,10 @@
   }
 
   function findPlaylistChoiceInMenu(menu, playlistName) {
-    const expected = compactText(playlistName);
-    const nodes = Array.from(menu.querySelectorAll("a, button, li, span, div"))
-      .filter((node) => isVisible(node))
-      .map((node) => {
-        const text = compactText(node.textContent);
-        return {
-          node,
-          text,
-          clickable: findClickableAncestor(node),
-        };
-      })
-      .filter((item) => item.text && (item.text === expected || item.text.includes(expected) || expected.includes(item.text)))
-      .map((item) => {
-        const exact = item.text === expected;
-        const clickableText = compactText(item.clickable ? item.clickable.textContent : "");
-        const descendantMatch = Array.from(item.node.querySelectorAll("a, button, li, span, div"))
-          .some((child) => child !== item.node && isVisible(child) && compactText(child.textContent) === expected);
-        const score =
-          (exact ? 100 : 0) +
-          (item.clickable && item.clickable !== menu ? 20 : 0) +
-          (!descendantMatch ? 15 : 0) +
-          (clickableText === expected ? 10 : 0) -
-          Math.min(item.text.length, 80);
-        return { ...item, score };
-      })
-      .sort((a, b) => b.score - a.score);
-    return nodes[0] ? nodes[0].clickable || nodes[0].node : null;
+    const nodes = [...menu.querySelectorAll('ul[role="menu"] .operate_menu__link')].filter((node) =>
+      isVisible(node) && normalizeText(node.getAttribute("title") || node.textContent) === normalizeText(playlistName));
+    if (nodes.length > 1) throw new Error("添加菜单中存在多个同名歌单，已停止。");
+    return nodes[0] || null;
   }
 
   function getPopupTipText() {
@@ -1160,70 +1094,51 @@
   }
 
   async function addCandidateToPlaylist(candidate, playlistName) {
-    await revealRowActions(candidate.row);
-    const addButton =
-      candidate.addButton ||
-      candidate.row.querySelector(".list_menu__add, [title='添加到歌单']");
-    if (!addButton) {
-      throw new Error("未找到“添加到歌单”按钮。");
+    assertActive();
+    if (!document.querySelector(".songlist__item input[type='checkbox']")) {
+      const batch = document.querySelector(".mod_btn__icon_batch")?.closest("a");
+      if (!batch) throw new Error("当前网页没有批量操作入口。");
+      await clickElement(batch);
+      await waitFor(() => document.querySelector(".songlist__item input[type='checkbox']"), 5000);
     }
-
-    const previousMenus = new Set(getVisibleOperateMenus());
-    await clickElement(addButton);
-    const menu = await waitFor(() => {
-      const visibleMenus = getVisibleOperateMenus();
-      return visibleMenus.find((node) => !previousMenus.has(node)) || visibleMenus[0] || null;
-    }, 5000);
-    if (!menu) {
-      throw new Error("未能打开歌单选择菜单。");
+    const selectedRow = [...document.querySelectorAll(".songlist__item")].find((row) =>
+      getSongLinkFromRow(row)?.getAttribute("href")?.includes(`/songDetail/${candidate.mid}`));
+    if (!selectedRow) throw new Error("候选歌曲已不在当前结果中。");
+    // Click the checkbox rather than assigning checked: QQ must receive its normal events.
+    for (const box of document.querySelectorAll(".songlist__item input[type='checkbox']")) {
+      const wanted = selectedRow.contains(box);
+      if (box.checked !== wanted) await clickElement(box);
     }
-
-    const choice = await waitFor(() => findPlaylistChoiceInMenu(menu, playlistName), 5000);
-    if (!choice) {
-      throw new Error(`未在添加菜单中找到目标歌单“${playlistName}”。`);
-    }
-
-    await clickElement(choice);
-    const result = await waitFor(() => {
-      const tipText = getPopupTipText();
-      if (tipText.includes("已在歌单中") || tipText.includes("已经在歌单中")) {
-        return "skipped";
+    const checked = [...document.querySelectorAll(".songlist__item input[type='checkbox']")].filter((box) => box.checked);
+    if (checked.length !== 1 || !selectedRow.contains(checked[0])) throw new Error("无法确认仅选中了目标歌曲。");
+    const add = document.querySelector(".mod_songlist_toolbar .mod_btn__icon_add")?.closest("a");
+    if (!add) throw new Error("未找到批量添加入口。");
+    await clickElement(add);
+    const menu = await waitFor(() => getVisibleOperateMenus().find((node) => node.id === "fav_pop"), 5000);
+    if (!menu) throw new Error("未打开歌单菜单。");
+    const choice = await waitFor(() => findPlaylistChoiceInMenu(menu, playlistName), 8000);
+    if (!choice) throw new Error("未找到名称完全一致的目标歌单。");
+    let freshTip = "";
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        const node = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (node?.closest(".mod_popup_tips, #popup") || [...record.addedNodes].some((n) => n.nodeType === 1 && (n.matches(".mod_popup_tips, #popup") || n.querySelector(".mod_popup_tips, #popup")))) {
+          freshTip = getPopupTipText();
+        }
       }
-      if (
-        tipText.includes("已添加") ||
-        tipText.includes("添加成功") ||
-        tipText.includes("收藏成功") ||
-        tipText.includes("成功加入歌单") ||
-        tipText.includes("已收藏到歌单")
-      ) {
-        return "added";
-      }
-      if (!isVisible(menu)) {
-        return "menu_closed";
-      }
-      return null;
-    }, 5000, 180);
-
-    if (result === "added" || result === "skipped") {
+    });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["class", "style"] });
+    try {
+      await clickElement(choice);
+      const result = await waitFor(() => {
+        if (/已在歌单中|已经在歌单中/.test(freshTip)) return "skipped";
+        if (/添加成功|成功加入歌单|已收藏到歌单/.test(freshTip)) return "added";
+        if (/失败|登录|错误/.test(freshTip)) throw new Error(freshTip);
+        return null;
+      }, 8000, 150);
+      if (!result) throw new Error("未检测到本次添加的成功提示；结果待核对，不自动重试。");
       return result;
-    }
-
-    await sleep(1200);
-    const tipText = getPopupTipText();
-    if (tipText.includes("已在歌单中") || tipText.includes("已经在歌单中")) {
-      return "skipped";
-    }
-    if (
-      tipText.includes("已添加") ||
-      tipText.includes("添加成功") ||
-      tipText.includes("收藏成功") ||
-      tipText.includes("成功加入歌单") ||
-      tipText.includes("已收藏到歌单")
-    ) {
-      return "added";
-    }
-
-    throw new Error("未检测到添加成功提示，可能未真正加入歌单。");
+    } finally { observer.disconnect(); }
   }
 
   async function processCurrentSong(job) {
@@ -1265,7 +1180,7 @@
 
     const rows = findSearchRows();
     const candidates = rows.map(extractCandidate).filter((candidate) => candidate.addButton);
-    const decision = chooseCandidate(candidates, current.song, current.artist);
+    const decision = chooseCandidate(candidates, current.song, current.artist, current);
 
     if (decision.type === "not_found") {
       current.status = "not_found";
@@ -1301,6 +1216,13 @@
       return;
     }
 
+    current.matched = { mid: decision.candidate.mid, title: decision.candidate.title, artists: decision.candidate.artists, album: decision.candidate.album };
+    if (job.preview) {
+      current.status = "matched"; current.detail = "预检匹配成功，未写入";
+      job.currentIndex += 1;
+      jobLog(job, "info", `预检匹配：${current.song} / ${decision.candidate.mid}`);
+      return;
+    }
     try {
       const result = await addCandidateToPlaylist(decision.candidate, job.playlistName);
       current.status = result;
@@ -1312,6 +1234,7 @@
         `${result === "skipped" ? "跳过" : "已添加"}：${current.song} - ${current.artist}`
       );
     } catch (error) {
+      if (error.cancelled) throw error;
       current.status = "failed";
       current.detail = error.message;
       job.currentIndex += 1;
@@ -1320,67 +1243,42 @@
   }
 
   async function runAutomation() {
-    if (runtime.automationLocked) {
+    if (runtime.automationLocked || loadJob()?.status !== "running") return;
+    if (!navigator.locks) {
+      withJob((job) => { job.status = "error"; jobLog(job, "error", "浏览器缺少 Web Locks，不能安全协调多个标签页。"); });
       return;
     }
-    const job = loadJob();
-    if (!job || job.status !== "running") {
-      return;
-    }
-
     runtime.automationLocked = true;
     try {
-      const latestJob = loadJob();
-      if (!latestJob || latestJob.status !== "running") {
-        return;
-      }
-
-      if (latestJob.stopRequested) {
-        latestJob.status = "stopped";
-        jobLog(latestJob, "warn", "任务已停止。");
-        saveJob(latestJob);
-        return;
-      }
-
-      if (!isLoggedIn()) {
-        latestJob.status = "error";
-        jobLog(latestJob, "error", "当前未检测到登录状态，请先登录 QQ 音乐后重试。");
-        saveJob(latestJob);
-        return;
-      }
-
-      if (!latestJob.playlistEnsured) {
-        const ensured = await ensurePlaylist(latestJob);
-        saveJob(latestJob);
-        if (!ensured) {
-          return;
-        }
-      }
-
-      if (latestJob.currentIndex >= latestJob.songs.length) {
-        latestJob.status = "finished";
-        jobLog(latestJob, "info", "所有歌曲处理完毕。");
-        saveJob(latestJob);
-        return;
-      }
-
-      await processCurrentSong(latestJob);
-      saveJob(latestJob);
-
-      if (latestJob.currentIndex >= latestJob.songs.length && latestJob.status === "running") {
-        latestJob.status = "finished";
-        jobLog(latestJob, "info", "导入任务完成。");
-        saveJob(latestJob);
-      }
-    } catch (error) {
-      console.error(error);
-      withJob((jobToUpdate) => {
-        jobToUpdate.status = "error";
-        jobLog(jobToUpdate, "error", error.message || "发生未知错误。");
+      await navigator.locks.request("qqmusic-import-v2", { ifAvailable: true }, async (lock) => {
+        if (!lock) return;
+        const job = loadJob();
+        if (!job || job.status !== "running") return;
+        runtime.activeJobId = job.id;
+        try {
+          assertActive();
+          if (!isLoggedIn()) throw new Error("未检测到 QQ 音乐登录状态，请先在网页登录。");
+          if (!job.preview && !job.playlistEnsured) {
+            const ensured = await ensurePlaylist(job);
+            saveJob(job);
+            if (!ensured) return;
+          }
+          if (job.currentIndex < job.songs.length) await processCurrentSong(job);
+          if (job.currentIndex >= job.songs.length) {
+            job.status = "finished";
+            jobLog(job, "info", job.preview ? "预检结束，请核对导出结果。" : "处理结束，请核对未成功项及歌单实际顺序。");
+          }
+          saveJob(job);
+        } catch (error) {
+          const current = loadJob();
+          if (current?.id === job.id) {
+            current.status = error.cancelled ? "stopped" : "error";
+            jobLog(current, error.cancelled ? "warn" : "error", error.message);
+            saveJob(current);
+          }
+        } finally { runtime.activeJobId = null; }
       });
-    } finally {
-      runtime.automationLocked = false;
-    }
+    } finally { runtime.automationLocked = false; }
   }
 
   function bootstrap() {

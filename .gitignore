@@ -1,5 +1,15 @@
 .DS_Store
 
+# Local import data and installation helpers
+/明日方舟-预检.csv
+/用户歌曲清单.json
+/发行日期证据.json
+/msr-*.json
+/install-*.png
+*.log
+*.pid
+/serve_install.py
+
 # Local QQ Music page snapshots used only for local debugging/analysis
 我的音乐 - QQ音乐-千万正版音乐海量无损曲库新歌热歌天天畅听的高品质音乐平台！.html
 我的音乐 - QQ音乐-千万正版音乐海量无损曲库新歌热歌天天畅听的高品质音乐平台！_files/
